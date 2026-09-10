@@ -36,7 +36,7 @@ PDF_TABLE_SETTINGS = {
     "intersection_y_tolerance": 3,
 }
 
-TEACHER_REGEX = re.compile(r'^[А-ЯІЇЄa-zA-Z\'-]+\s+[А-ЯІЇЄA-Z]\.\s*[А-ЯІЇЄA-Z]\.$')
+TEACHER_REGEX = re.compile(r'^[А-ЯІЇЄа-яіїєA-Za-z\'-]+\s+[А-ЯІЇЄA-Z]\.\s*[А-ЯІЇЄA-Z]\.$')
 ROOM_REGEX = re.compile(r'^(?:ауд\.?\s*)?(\d{3}[а-яА-Яa-zA-Z]?|сп\.з\.|каб\.?\s*\d+)(?:\s*/\s*\d+)?$', re.IGNORECASE)
 
 
@@ -165,14 +165,50 @@ def extract_groups_from_pdf(course: int) -> List[str]:
     return sorted(list(groups)) if groups else FALLBACK_GROUPS.get(course, [])
 
 
+def _row_para_num(row) -> Optional[int]:
+    """Ищет номер пары (арабский или римский) в первых 4 ячейках строки."""
+    if not row:
+        return None
+    for cell in row[:4]:
+        if not cell:
+            continue
+        val = str(cell).strip()
+        if val.isdigit() and 1 <= int(val) <= 6:
+            return int(val)
+        rom = roman_to_arabic(val)
+        if rom and 1 <= rom <= 6:
+            return rom
+    return None
+
+
+def _cells_to_text(cells: List[str]) -> str:
+    return "\n".join(
+        t for t in cells if t and t.lower() not in ["none", "null", "—", "-", ""]
+    )
+
+
 def parse_tables_in_memory(tables: List, group: str, day_index: int) -> List[Dict]:
-    """Быстро разбирает извлеченные из PDF таблицы в оперативной памяти."""
+    """Быстро разбирает извлеченные из PDF таблицы в оперативной памяти.
+
+    В файлах розкладу деякі клітинки пари фізично поділені на дві половини
+    (верхню і нижню) горизонтальною лінією — це означає, що предмет
+    чергується залежно від парності числа місяця (дня). pdfplumber
+    повертає нижню половину як окремий "продовжуючий" рядок одразу під
+    основним рядком пари, без номера пари в перших колонках. Якщо для
+    колонок нашої групи в цьому продовжуючому рядку є хоч якесь значення
+    (навіть порожній рядок, а не None) — значить клітинка була поділена,
+    і потрібно розрізняти верхню (парні дні) та нижню (непарні дні) пари.
+    Якщо продовжуючого рядка немає або він не зачіпає нашу групу — пара
+    звичайна і діє в будь-який день (parity="any").
+    """
     group_norm = normalize_group(group)
     day_name = DAY_INDEX_TO_NAME.get(day_index)
     if not day_name or not tables:
         return []
 
-    lessons = []
+    # pair_number -> list of (parity, subject, teacher, room)
+    lessons_by_pair: Dict[int, List[Tuple[str, str, str, str]]] = {}
+
     for table in tables:
         if not table or len(table) < 2:
             continue
@@ -199,8 +235,13 @@ def parse_tables_in_memory(tables: List, group: str, day_index: int) -> List[Dic
             continue
 
         current_day = None
-        for row in table:
+        n_rows = len(table)
+        row_idx = 0
+
+        while row_idx < n_rows:
+            row = table[row_idx]
             if not row:
+                row_idx += 1
                 continue
 
             for cell in row[:4]:
@@ -209,52 +250,73 @@ def parse_tables_in_memory(tables: List, group: str, day_index: int) -> List[Dic
                     current_day = d
                     break
 
-            if current_day != day_name:
+            para_num = _row_para_num(row)
+
+            if para_num is None or current_day != day_name:
+                row_idx += 1
                 continue
 
-            para_num = None
-            for cell in row[:4]:
-                if not cell:
-                    continue
-                val = str(cell).strip()
-                if val.isdigit() and 1 <= int(val) <= 6:
-                    para_num = int(val)
-                    break
-                rom = roman_to_arabic(val)
-                if rom and 1 <= rom <= 6:
-                    para_num = rom
-                    break
-
-            if not para_num:
-                continue
-
-            raw_cells = []
+            # Верхня половина клітинки (основний рядок пари)
+            top_cells = []
             for c_idx in target_cols:
-                if c_idx < len(row) and row[c_idx]:
-                    text = str(row[c_idx]).strip()
-                    if text and text.lower() not in ["none", "null", "—", "-", ""]:
-                        raw_cells.append(text)
+                if c_idx < len(row) and row[c_idx] is not None:
+                    top_cells.append(str(row[c_idx]).strip())
 
-            if not raw_cells:
-                continue
+            # Перевіряємо наступний рядок — це може бути "нижня" половина
+            # тієї ж клітинки (продовження без номера пари)
+            bottom_cells: Optional[List[str]] = None
+            if row_idx + 1 < n_rows:
+                next_row = table[row_idx + 1]
+                if next_row and _row_para_num(next_row) is None:
+                    is_split_for_group = any(
+                        c_idx < len(next_row) and next_row[c_idx] is not None
+                        for c_idx in target_cols
+                    )
+                    if is_split_for_group:
+                        bottom_cells = [
+                            str(next_row[c_idx]).strip()
+                            if c_idx < len(next_row) and next_row[c_idx] is not None
+                            else ""
+                            for c_idx in target_cols
+                        ]
+                    row_idx += 1  # рядок-продовження вже враховано, пропускаємо
 
-            combined_raw = "\n".join(raw_cells)
-            subj, teacher, room = parse_cell_structured(combined_raw)
+            top_subj, top_teacher, top_room = parse_cell_structured(_cells_to_text(top_cells))
 
-            if not subj or subj.isdigit() or len(subj) < 2:
-                continue
+            if bottom_cells is not None:
+                bottom_subj, bottom_teacher, bottom_room = parse_cell_structured(_cells_to_text(bottom_cells))
 
+                if top_subj and not top_subj.isdigit() and len(top_subj) >= 2:
+                    lessons_by_pair.setdefault(para_num, []).append(
+                        ("even", top_subj, top_teacher, top_room)
+                    )
+                if bottom_subj and not bottom_subj.isdigit() and len(bottom_subj) >= 2:
+                    lessons_by_pair.setdefault(para_num, []).append(
+                        ("odd", bottom_subj, bottom_teacher, bottom_room)
+                    )
+            else:
+                if top_subj and not top_subj.isdigit() and len(top_subj) >= 2:
+                    lessons_by_pair.setdefault(para_num, []).append(
+                        ("any", top_subj, top_teacher, top_room)
+                    )
+
+            row_idx += 1
+
+    lessons = []
+    for para_num, entries in lessons_by_pair.items():
+        for parity, subj, teacher, room in entries:
             lessons.append({
                 "number": para_num,
                 "time": LESSON_TIMES.get(para_num, ""),
                 "subject": subj,
                 "teacher": teacher,
                 "room": room,
-                "cancelled": False
+                "cancelled": False,
+                "parity": parity,
             })
 
-    res = {l["number"]: l for l in lessons}
-    return [res[k] for k in sorted(res.keys())]
+    lessons.sort(key=lambda l: (l["number"], l["parity"]))
+    return lessons
 
 
 async def build_and_save_schedule_cache(courses: List[int], semester: int):
@@ -295,17 +357,34 @@ async def build_and_save_schedule_cache(courses: List[int], semester: int):
 
 
 def get_schedule_from_file_cache(course: int, semester: int, group: str, target_date: datetime) -> List[Dict]:
-    """Мгновенно достает расписание группы из локального JSON-файла."""
+    """Мгновенно достает расписание группы из локального JSON-файла.
+
+    Пари, які чергуються (верх/низ клітинки), фільтруються за парністю
+    числа місяця конкретної дати: парне число — предмет "зверху",
+    непарне — предмет "знизу". Звичайні (нечергуючі) пари показуються
+    в будь-який день.
+    """
     group_norm = normalize_group(group)
     day_index = target_date.weekday()
     key = f"{course}_{group_norm}_{day_index}"
+    is_even_day = target_date.day % 2 == 0
 
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 cache_data = json.load(f)
                 if key in cache_data:
-                    return cache_data[key]
+                    all_lessons = cache_data[key]
+                    result = []
+                    for lesson in all_lessons:
+                        parity = lesson.get("parity", "any")
+                        if parity == "any":
+                            result.append(lesson)
+                        elif parity == "even" and is_even_day:
+                            result.append(lesson)
+                        elif parity == "odd" and not is_even_day:
+                            result.append(lesson)
+                    return result
         except Exception as e:
             logger.error(f"Ошибка чтения файла кэша: {e}")
 
