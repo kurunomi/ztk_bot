@@ -8,13 +8,19 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
 
 from config import BOT_TOKEN, TIMEZONE
 from keyboards import get_course_keyboard, get_group_keyboard, get_day_keyboard
 from states import ScheduleStates
-from schedule_parser import get_schedule_for_group, get_substitutions
-from schedule_parser import format_schedule_response
-from utils import get_current_semester, get_today_date, get_tomorrow_date, format_schedule_message
+from schedule_parser import (
+    build_and_save_schedule_cache,
+    get_schedule_from_file_cache,
+    get_substitutions,
+    apply_substitutions,
+    format_schedule_response
+)
+from utils import get_current_semester, get_today_date, get_tomorrow_date
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -27,6 +33,14 @@ dp = Dispatcher(storage=MemoryStorage())
 def get_day_name(weekday: int) -> str:
     days = ["Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота", "Неділя"]
     return days[weekday]
+
+
+async def safe_answer_callback(callback: CallbackQuery):
+    """Безопасный ответ на callback во избежание TelegramBadRequest."""
+    try:
+        await callback.answer()
+    except TelegramBadRequest:
+        pass
 
 
 @dp.message(CommandStart())
@@ -51,6 +65,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @dp.callback_query(ScheduleStates.choosing_course, F.data.startswith("course_"))
 async def process_course(callback: CallbackQuery, state: FSMContext):
+    await safe_answer_callback(callback)
     course = int(callback.data.split("_")[1])
     await state.update_data(course=course)
 
@@ -60,11 +75,11 @@ async def process_course(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_group_keyboard(course)
     )
     await state.set_state(ScheduleStates.choosing_group)
-    await callback.answer()
 
 
 @dp.callback_query(ScheduleStates.choosing_group, F.data.startswith("group_"))
 async def process_group(callback: CallbackQuery, state: FSMContext):
+    await safe_answer_callback(callback)
     group = callback.data.split("_", 1)[1]
     await state.update_data(group=group)
 
@@ -74,11 +89,11 @@ async def process_group(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_day_keyboard()
     )
     await state.set_state(ScheduleStates.choosing_day)
-    await callback.answer()
 
 
 @dp.callback_query(ScheduleStates.choosing_day, F.data.in_({"day_today", "day_tomorrow"}))
 async def process_day(callback: CallbackQuery, state: FSMContext):
+    await safe_answer_callback(callback)
     data = await state.get_data()
     course = data["course"]
     group = data["group"]
@@ -97,9 +112,26 @@ async def process_day(callback: CallbackQuery, state: FSMContext):
     )
 
     try:
-        schedule = await get_schedule_for_group(course, semester, group, target)
-        sub_info = await get_substitutions(group, target)
-        text = format_schedule_message(group, course, semester, target, schedule, sub_info)
+        # 1. Достаем базовые пары мгновенно из локального JSON файла
+        base_lessons = get_schedule_from_file_cache(course, semester, group, target)
+
+        # 2. Замены качаем и парсим с сайта в режиме реального времени
+        has_sub_file, has_group_subs, subs = await get_substitutions(group, target)
+
+        # 3. Накладываем замены
+        final_lessons = apply_substitutions(base_lessons, subs)
+
+        # 4. Собираем финальное сообщение
+        text = format_schedule_response(
+            group=group,
+            course=course,
+            semester=semester,
+            date_obj=target,
+            has_sub_file=has_sub_file,
+            has_group_subs=has_group_subs,
+            lessons=final_lessons
+        )
+
     except Exception as e:
         logger.error(f"Error getting schedule: {e}", exc_info=True)
         text = (
@@ -116,11 +148,11 @@ async def process_day(callback: CallbackQuery, state: FSMContext):
     ])
     await callback.message.answer("Що далі?", reply_markup=kb)
     await state.clear()
-    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("reday_"))
 async def reday(callback: CallbackQuery, state: FSMContext):
+    await safe_answer_callback(callback)
     _, group, course_str = callback.data.split("_", 2)
     await state.update_data(group=group, course=int(course_str))
 
@@ -130,11 +162,11 @@ async def reday(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_day_keyboard()
     )
     await state.set_state(ScheduleStates.choosing_day)
-    await callback.answer()
 
 
 @dp.callback_query(F.data == "restart")
 async def restart(callback: CallbackQuery, state: FSMContext):
+    await safe_answer_callback(callback)
     await state.clear()
     semester = get_current_semester()
     today = get_today_date()
@@ -149,7 +181,6 @@ async def restart(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_course_keyboard()
     )
     await state.set_state(ScheduleStates.choosing_course)
-    await callback.answer()
 
 
 @dp.callback_query(F.data == "back_to_courses")
@@ -159,6 +190,14 @@ async def back_to_courses(callback: CallbackQuery, state: FSMContext):
 
 async def main():
     logger.info("Starting bot...")
+
+    # Очистка застрявших старых запросов от Telegram при старте
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    # Автоматическая сборка и сохранение кэша всех пар в schedule_cache.json
+    semester = get_current_semester()
+    await build_and_save_schedule_cache([1, 2, 3, 4], semester)
+
     await dp.start_polling(bot)
 
 

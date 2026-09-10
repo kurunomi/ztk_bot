@@ -170,7 +170,7 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 ```
 
-> Заміни `your_user` на своє ім'я користувача. Перевір шлях командою `pwd` з папки проєкту.
+> Заміни `your_user` на своє ім'я користувача. Перевір шлях командою `pwd` з папки проєкту AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.
 
 ```bash
 sudo systemctl daemon-reload

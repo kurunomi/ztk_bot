@@ -1,8 +1,10 @@
 import io
+import json
 import logging
+import os
 import re
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from bs4 import BeautifulSoup
 
@@ -11,18 +13,19 @@ import pdfplumber
 import pytz
 
 from config import (
-    get_local_schedule_path,
     SCHEDULE_PAGE_URL,
     SUBSTITUTIONS_BASE_URL,
     LESSON_TIMES,
     TIMEZONE,
     FALLBACK_GROUPS,
+    get_local_schedule_path,
 )
 
 logger = logging.getLogger(__name__)
 TZ = pytz.timezone(TIMEZONE)
-
 DAY_INDEX_TO_NAME = {0: "Понеділок", 1: "Вівторок", 2: "Середа", 3: "Четвер", 4: "П'ятниця"}
+
+CACHE_FILE = "schedule_cache.json"
 
 PDF_TABLE_SETTINGS = {
     "vertical_strategy": "lines",
@@ -38,20 +41,20 @@ ROOM_REGEX = re.compile(r'^(?:ауд\.?\s*)?(\d{3}[а-яА-Яa-zA-Z]?|сп\.з\.
 
 
 def normalize_group(name: str) -> str:
-    """Унифицирует название группы (удаляет пробелы, дефисы, приводить к единому регистру/алфавиту)."""
+    """Унифицирует название группы."""
     if not name:
         return ""
     s = re.sub(r"[^А-ЯІЇЄA-Z0-9]", "", str(name).upper())
     trans = str.maketrans({
-        "A": "А", "B": "Б", "E": "Е", "I": "І", "K": "К", 
-        "M": "М", "H": "Н", "O": "О", "P": "Р", "C": "С", 
+        "A": "А", "B": "Б", "E": "Е", "I": "І", "K": "К",
+        "M": "М", "H": "Н", "O": "О", "P": "Р", "C": "С",
         "T": "Т", "X": "Х"
     })
     return s.translate(trans)
 
 
 def clean_day_text(text: str) -> str:
-    """Очищает текст дня недели от переносов и спецсимволов."""
+    """Очищает текст дня недели."""
     if not text:
         return ""
     s = str(text).replace('\n', '').replace(' ', '').replace('\r', '').upper()
@@ -60,7 +63,7 @@ def clean_day_text(text: str) -> str:
 
 
 def get_normal_day(text) -> Optional[str]:
-    """Устойчивое определение дня недели."""
+    """Определение дня недели."""
     if not text:
         return None
     t = clean_day_text(text)
@@ -88,7 +91,7 @@ def roman_to_arabic(val: str) -> Optional[int]:
 
 
 def expand_para_range(val: str) -> List[int]:
-    """Разворачивает диапазоны пар, например 'I-III' -> [1, 2, 3]."""
+    """Разворачивает диапазоны пар."""
     clean = str(val).strip().upper().replace('І', 'I').replace('Ї', 'I')
     parts = clean.split('-')
     if len(parts) == 2:
@@ -101,8 +104,18 @@ def expand_para_range(val: str) -> List[int]:
 
 
 def parse_cell_structured(cell_text: str) -> Tuple[str, str, str]:
-    """Разбирает мультистрочную ячейку на Предмет, Преподавателя и Аудиторию."""
-    lines = [l.strip() for l in cell_text.split('\n') if l.strip()]
+    """Разбирает ячейку и склеивает оторванные буквы корпусов (например 111 + а -> 111а)."""
+    raw_lines = [l.strip() for l in cell_text.split('\n') if l.strip()]
+
+    lines = []
+    for line in raw_lines:
+        if lines and re.match(r'^[а-яА-Яa-zA-Z](\s*/\s*\d+)?$', line):
+            prev = lines[-1]
+            if re.search(r'\d{3}$', prev) or re.search(r'ауд\.?\s*\d+$', prev, re.I):
+                lines[-1] = prev + line
+                continue
+        lines.append(line)
+
     subjects = []
     teachers = []
     rooms = []
@@ -125,7 +138,7 @@ def parse_cell_structured(cell_text: str) -> Tuple[str, str, str]:
 
 
 def extract_groups_from_pdf(course: int) -> List[str]:
-    """Извлекает названия всех групп из всех страниц PDF-файла расписания."""
+    """Извлекает названия всех групп из PDF курса."""
     pdf_path = get_local_schedule_path(course)
     if not pdf_path.exists():
         return FALLBACK_GROUPS.get(course, [])
@@ -152,8 +165,155 @@ def extract_groups_from_pdf(course: int) -> List[str]:
     return sorted(list(groups)) if groups else FALLBACK_GROUPS.get(course, [])
 
 
+def parse_tables_in_memory(tables: List, group: str, day_index: int) -> List[Dict]:
+    """Быстро разбирает извлеченные из PDF таблицы в оперативной памяти."""
+    group_norm = normalize_group(group)
+    day_name = DAY_INDEX_TO_NAME.get(day_index)
+    if not day_name or not tables:
+        return []
+
+    lessons = []
+    for table in tables:
+        if not table or len(table) < 2:
+            continue
+
+        col_to_group = {}
+        current_grp = None
+
+        for c in range(len(table[0])):
+            cell_group = None
+            for r in range(min(5, len(table))):
+                if c < len(table[r]) and table[r][c]:
+                    val_str = str(table[r][c])
+                    found = re.findall(r'\b[А-ЯІЇЄa-zA-Z]{1,3}\s*[-]?\s*\d{2}[А-ЯІЇЄa-zA-Z]?\b', val_str)
+                    if found:
+                        cell_group = normalize_group(found[0])
+                        break
+            if cell_group:
+                current_grp = cell_group
+            if current_grp:
+                col_to_group[c] = current_grp
+
+        target_cols = [c for c, grp in col_to_group.items() if grp == group_norm]
+        if not target_cols:
+            continue
+
+        current_day = None
+        for row in table:
+            if not row:
+                continue
+
+            for cell in row[:4]:
+                d = get_normal_day(cell)
+                if d:
+                    current_day = d
+                    break
+
+            if current_day != day_name:
+                continue
+
+            para_num = None
+            for cell in row[:4]:
+                if not cell:
+                    continue
+                val = str(cell).strip()
+                if val.isdigit() and 1 <= int(val) <= 6:
+                    para_num = int(val)
+                    break
+                rom = roman_to_arabic(val)
+                if rom and 1 <= rom <= 6:
+                    para_num = rom
+                    break
+
+            if not para_num:
+                continue
+
+            raw_cells = []
+            for c_idx in target_cols:
+                if c_idx < len(row) and row[c_idx]:
+                    text = str(row[c_idx]).strip()
+                    if text and text.lower() not in ["none", "null", "—", "-", ""]:
+                        raw_cells.append(text)
+
+            if not raw_cells:
+                continue
+
+            combined_raw = "\n".join(raw_cells)
+            subj, teacher, room = parse_cell_structured(combined_raw)
+
+            if not subj or subj.isdigit() or len(subj) < 2:
+                continue
+
+            lessons.append({
+                "number": para_num,
+                "time": LESSON_TIMES.get(para_num, ""),
+                "subject": subj,
+                "teacher": teacher,
+                "room": room,
+                "cancelled": False
+            })
+
+    res = {l["number"]: l for l in lessons}
+    return [res[k] for k in sorted(res.keys())]
+
+
+async def build_and_save_schedule_cache(courses: List[int], semester: int):
+    """Считывает PDF 1 раз на курс и за секунды формирует schedule_cache.json."""
+    logger.info("⏳ Начинаем быструю сборку кэша расписания в JSON...")
+    cache_data = {}
+
+    for course in courses:
+        pdf_path = get_local_schedule_path(course)
+        if not pdf_path.exists():
+            continue
+
+        try:
+            tables = []
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    t = page.extract_tables(table_settings=PDF_TABLE_SETTINGS)
+                    if t:
+                        tables.extend(t)
+
+            groups = extract_groups_from_pdf(course)
+
+            for day_index in range(5):
+                for group in groups:
+                    lessons = parse_tables_in_memory(tables, group, day_index)
+                    key = f"{course}_{normalize_group(group)}_{day_index}"
+                    cache_data[key] = lessons
+
+        except Exception as e:
+            logger.error(f"Ошибка сборки кэша для курса {course}: {e}")
+
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        logger.info(f"✅ Кэш расписания успешно сохранен в {CACHE_FILE}")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения файла кэша: {e}")
+
+
+def get_schedule_from_file_cache(course: int, semester: int, group: str, target_date: datetime) -> List[Dict]:
+    """Мгновенно достает расписание группы из локального JSON-файла."""
+    group_norm = normalize_group(group)
+    day_index = target_date.weekday()
+    key = f"{course}_{group_norm}_{day_index}"
+
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+                if key in cache_data:
+                    return cache_data[key]
+        except Exception as e:
+            logger.error(f"Ошибка чтения файла кэша: {e}")
+
+    return []
+
+
 async def fetch_substitution_pdf(target_date: datetime) -> Optional[bytes]:
-    """Загружает PDF-файл замен с сайта ztk.org.ua."""
+    """Загружает файл замен с сайта."""
     date_str = target_date.strftime("%d.%m.%Y")
     direct_url = f"{SUBSTITUTIONS_BASE_URL}{date_str}.pdf"
     headers = {
@@ -183,109 +343,6 @@ async def fetch_substitution_pdf(target_date: datetime) -> Optional[bytes]:
     return None
 
 
-def parse_schedule_pdf(pdf_bytes: bytes, group: str, day_index: int, target_date: datetime) -> List[Dict]:
-    """Парсит основной файл расписания."""
-    group_norm = normalize_group(group)
-    day_name = DAY_INDEX_TO_NAME.get(day_index)
-    if not day_name:
-        return []
-
-    lessons = []
-
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables(table_settings=PDF_TABLE_SETTINGS)
-                if not tables:
-                    continue
-
-                for table in tables:
-                    if not table or len(table) < 2:
-                        continue
-
-                    col_to_group = {}
-                    current_grp = None
-
-                    for c in range(len(table[0])):
-                        cell_group = None
-                        for r in range(min(5, len(table))):
-                            if c < len(table[r]) and table[r][c]:
-                                val_str = str(table[r][c])
-                                found = re.findall(r'\b[А-ЯІЇЄa-zA-Z]{1,3}\s*[-]?\s*\d{2}[А-ЯІЇЄa-zA-Z]?\b', val_str)
-                                if found:
-                                    cell_group = normalize_group(found[0])
-                                    break
-                        if cell_group:
-                            current_grp = cell_group
-                        if current_grp:
-                            col_to_group[c] = current_grp
-
-                    target_cols = [c for c, grp in col_to_group.items() if grp == group_norm]
-                    if not target_cols:
-                        continue
-
-                    current_day = None
-                    for row in table:
-                        if not row:
-                            continue
-
-                        for cell in row[:4]:
-                            d = get_normal_day(cell)
-                            if d:
-                                current_day = d
-                                break
-
-                        if current_day != day_name:
-                            continue
-
-                        para_num = None
-                        for cell in row[:4]:
-                            if not cell:
-                                continue
-                            val = str(cell).strip()
-                            if val.isdigit() and 1 <= int(val) <= 6:
-                                para_num = int(val)
-                                break
-                            rom = roman_to_arabic(val)
-                            if rom and 1 <= rom <= 6:
-                                para_num = rom
-                                break
-
-                        if not para_num:
-                            continue
-
-                        raw_cells = []
-                        for c_idx in target_cols:
-                            if c_idx < len(row) and row[c_idx]:
-                                text = str(row[c_idx]).strip()
-                                if text and text.lower() not in ["none", "null", "—", "-", ""]:
-                                    raw_cells.append(text)
-
-                        if not raw_cells:
-                            continue
-
-                        combined_raw = "\n".join(raw_cells)
-                        subj, teacher, room = parse_cell_structured(combined_raw)
-
-                        if not subj or subj.isdigit() or len(subj) < 2:
-                            continue
-
-                        lessons.append({
-                            "number": para_num,
-                            "time": LESSON_TIMES.get(para_num, ""),
-                            "subject": subj,
-                            "teacher": teacher,
-                            "room": room,
-                            "cancelled": False
-                        })
-
-    except Exception as e:
-        logger.error(f"Ошибка парсинга таблицы расписания: {e}", exc_info=True)
-
-    res = {l["number"]: l for l in lessons}
-    return [res[k] for k in sorted(res.keys())]
-
-
 def parse_substitutions_pdf(pdf_bytes: bytes, group: str) -> List[Dict]:
     """Парсит файлы замен."""
     subs_list = []
@@ -299,7 +356,7 @@ def parse_substitutions_pdf(pdf_bytes: bytes, group: str) -> List[Dict]:
                     for row in table:
                         if not row or all(c is None for c in row):
                             continue
-                        
+
                         group_col = row[0] if len(row) > 0 else None
                         para_col = row[1] if len(row) > 1 else None
                         subject = row[2] if len(row) > 2 else None
@@ -317,7 +374,7 @@ def parse_substitutions_pdf(pdf_bytes: bytes, group: str) -> List[Dict]:
                             continue
 
                         is_cancelled = (subject and ('---' in str(subject) or 'відміна' in str(subject).lower())) or bool(re.match(r'^[-—_\s]+$', str(subject or '')))
-                        
+
                         clean_subj = "ВІДМІНЕНО" if is_cancelled else str(subject or "").replace('\n', ' ').strip()
                         clean_teacher = "—" if is_cancelled else str(teacher or "").replace('\n', ' ').strip()
                         clean_room = "—" if is_cancelled else str(room or "").replace('\n', ' ').strip()
@@ -339,35 +396,26 @@ def parse_substitutions_pdf(pdf_bytes: bytes, group: str) -> List[Dict]:
     return subs_list
 
 
-async def get_schedule_for_group(course: int, semester: int, group: str, target_date: datetime) -> List[Dict]:
-    pdf_path = get_local_schedule_path(course)
-    if not pdf_path.exists():
-        return []
-    
-    with open(pdf_path, "rb") as f:
-        pdf_bytes = f.read()
-
-    return parse_schedule_pdf(pdf_bytes, group, target_date.weekday(), target_date)
-
-
 async def get_substitutions(group: str, target_date: datetime) -> Tuple[bool, bool, List[Dict]]:
+    """Парсит замены из интернета в реальном времени."""
     pdf_bytes = await fetch_substitution_pdf(target_date)
     if not pdf_bytes:
         return False, False, []
-        
+
     subs_list = parse_substitutions_pdf(pdf_bytes, group)
     return True, len(subs_list) > 0, subs_list
 
 
 def apply_substitutions(lessons: List[Dict], subs: List[Dict]) -> List[Dict]:
+    """Накладывает замены на базовое расписание."""
     subs_map = {s["pair_number"]: s for s in subs}
     updated_lessons = []
     all_pair_nums = set(l["number"] for l in lessons).union(subs_map.keys())
-    
+
     for p_num in sorted(all_pair_nums):
         sub = subs_map.get(p_num)
         orig = next((l for l in lessons if l["number"] == p_num), None)
-        
+
         if sub:
             if sub["cancelled"]:
                 updated_lessons.append({
@@ -389,12 +437,12 @@ def apply_substitutions(lessons: List[Dict], subs: List[Dict]) -> List[Dict]:
                 })
         elif orig:
             updated_lessons.append(orig)
-            
+
     return updated_lessons
 
 
 def format_lesson_line(lesson: dict) -> str:
-    """Форматирует одну строку пары в вид: 1. 08:00–09:20 — Название (Преподаватель) [ауд. Кабинет]"""
+    """Форматирует строчку пары."""
     num = lesson["number"]
     time_str = lesson.get("time", LESSON_TIMES.get(num, ""))
     subj = lesson.get("subject", "—")
@@ -405,7 +453,6 @@ def format_lesson_line(lesson: dict) -> str:
         return f"{num}. {time_str} — ❌ {subj}"
 
     teacher_part = f" ({teacher})" if teacher and teacher != "—" else ""
-
     room_part = ""
     if room and room != "—":
         if any(kw in room.lower() for kw in ["ауд", "каб", "сп"]):
@@ -417,15 +464,15 @@ def format_lesson_line(lesson: dict) -> str:
 
 
 def format_schedule_response(
-    group: str, 
-    course: int, 
-    semester: int, 
-    date_obj: datetime, 
-    has_sub_file: bool, 
-    has_group_subs: bool, 
+    group: str,
+    course: int,
+    semester: int,
+    date_obj: datetime,
+    has_sub_file: bool,
+    has_group_subs: bool,
     lessons: List[dict]
 ) -> str:
-    """Собирает готовый текст ответа в формате Telegram-бота."""
+    """Генерирует итоговый текст ответа пользователю."""
     day_name = DAY_INDEX_TO_NAME.get(date_obj.weekday(), "")
     date_str = date_obj.strftime("%d.%m.%Y")
 
