@@ -1,11 +1,13 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import pytz
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TIMEZONE = "Europe/Kiev"
+TZ = pytz.timezone(TIMEZONE)
 
 # Базовая директория проекта
 BASE_DIR = Path(__file__).parent

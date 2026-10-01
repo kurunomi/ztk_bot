@@ -10,23 +10,59 @@ from bs4 import BeautifulSoup
 
 import aiohttp
 import pdfplumber
-import pytz
 
 from config import (
     SCHEDULE_PAGE_URL,
     SUBSTITUTIONS_BASE_URL,
     LESSON_TIMES,
-    TIMEZONE,
     FALLBACK_GROUPS,
     get_local_schedule_path,
 )
 
 logger = logging.getLogger(__name__)
-TZ = pytz.timezone(TIMEZONE)
 DAY_INDEX_TO_NAME = {0: "Понеділок", 1: "Вівторок", 2: "Середа", 3: "Четвер", 4: "П'ятниця"}
 
 CACHE_FILE = "schedule_cache.json"
 
+# ---------------------------------------------------------------------------
+# In-memory кеши (заполняются при старте, пересоздаются ежедневно в 00:00)
+# ---------------------------------------------------------------------------
+_schedule_cache: Dict[str, List[Dict]] = {}
+_groups_cache: Dict[int, List[str]] = {}
+
+# ---------------------------------------------------------------------------
+# Shared aiohttp session (переиспользуется для всех HTTP-запросов)
+# ---------------------------------------------------------------------------
+_http_session: Optional[aiohttp.ClientSession] = None
+
+_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Referer": SCHEDULE_PAGE_URL,
+}
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    """Возвращает единую aiohttp-сессию (lazy init)."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(
+            headers=_HTTP_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
+    return _http_session
+
+
+async def close_http_session():
+    """Закрывает shared HTTP-сессию (вызывается при остановке бота)."""
+    global _http_session
+    if _http_session is not None and not _http_session.closed:
+        await _http_session.close()
+        _http_session = None
+
+
+# ---------------------------------------------------------------------------
+# PDF parsing settings & helpers
+# ---------------------------------------------------------------------------
 PDF_TABLE_SETTINGS = {
     "vertical_strategy": "lines",
     "horizontal_strategy": "lines",
@@ -75,7 +111,7 @@ def get_normal_day(text) -> Optional[str]:
         return 'Середа'
     if 'ЧЕТВЕР' in t or 'РЕВТЕЧ' in t:
         return 'Четвер'
-    if 'ПЯТН' in t or 'П\'ЯТН' in t or 'П’ЯТН' in t or 'ЯЦИНТЯ' in t:
+    if 'ПЯТН' in t or 'П\'ЯТН' in t or 'П\u2019ЯТН' in t or 'ЯЦИНТЯ' in t:
         return "П'ятниця"
     return None
 
@@ -137,11 +173,19 @@ def parse_cell_structured(cell_text: str) -> Tuple[str, str, str]:
     return subj_str, teach_str, room_str
 
 
+# ---------------------------------------------------------------------------
+# Group extraction (with in-memory cache)
+# ---------------------------------------------------------------------------
 def extract_groups_from_pdf(course: int) -> List[str]:
-    """Извлекает названия всех групп из PDF курса."""
+    """Извлекает названия всех групп из PDF курса (с кешированием в памяти)."""
+    if course in _groups_cache:
+        return _groups_cache[course]
+
     pdf_path = get_local_schedule_path(course)
     if not pdf_path.exists():
-        return FALLBACK_GROUPS.get(course, [])
+        result = FALLBACK_GROUPS.get(course, [])
+        _groups_cache[course] = result
+        return result
 
     groups = set()
     try:
@@ -162,9 +206,14 @@ def extract_groups_from_pdf(course: int) -> List[str]:
     except Exception as e:
         logger.error(f"Ошибка при считывании групп: {e}")
 
-    return sorted(list(groups)) if groups else FALLBACK_GROUPS.get(course, [])
+    result = sorted(list(groups)) if groups else FALLBACK_GROUPS.get(course, [])
+    _groups_cache[course] = result
+    return result
 
 
+# ---------------------------------------------------------------------------
+# PDF table parsing
+# ---------------------------------------------------------------------------
 def _row_para_num(row) -> Optional[int]:
     """Ищет номер пары (арабский или римский) в первых 4 ячейках строки."""
     if not row:
@@ -319,14 +368,22 @@ def parse_tables_in_memory(tables: List, group: str, day_index: int) -> List[Dic
     return lessons
 
 
+# ---------------------------------------------------------------------------
+# Cache build / read / rebuild
+# ---------------------------------------------------------------------------
 async def build_and_save_schedule_cache(courses: List[int], semester: int):
-    """Считывает PDF 1 раз на курс и за секунды формирует schedule_cache.json."""
-    logger.info("⏳ Начинаем быструю сборку кэша расписания в JSON...")
-    cache_data = {}
+    """Считывает PDF 1 раз на курс и формирует schedule_cache.json + in-memory кеш."""
+    global _schedule_cache
+    logger.info("⏳ Начинаем быструю сборку кэша расписания...")
+    cache_data: Dict[str, List[Dict]] = {}
+
+    # Сбрасываем кеш групп для повторного извлечения из PDF
+    _groups_cache.clear()
 
     for course in courses:
         pdf_path = get_local_schedule_path(course)
         if not pdf_path.exists():
+            logger.warning(f"PDF для курса {course} не найден: {pdf_path}")
             continue
 
         try:
@@ -348,75 +405,110 @@ async def build_and_save_schedule_cache(courses: List[int], semester: int):
         except Exception as e:
             logger.error(f"Ошибка сборки кэша для курса {course}: {e}")
 
+    # Сохраняем на диск (бекап)
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
-        logger.info(f"✅ Кэш расписания успешно сохранен в {CACHE_FILE}")
+        logger.info(f"✅ Кэш сохранен в {CACHE_FILE}")
     except Exception as e:
         logger.error(f"Ошибка сохранения файла кэша: {e}")
 
+    # Атомарно обновляем in-memory кеш
+    _schedule_cache = cache_data
+    logger.info(f"✅ In-memory кэш загружен ({len(cache_data)} ключей)")
+
 
 def get_schedule_from_file_cache(course: int, semester: int, group: str, target_date: datetime) -> List[Dict]:
-    """Мгновенно достает расписание группы из локального JSON-файла.
+    """Мгновенно достает расписание группы из in-memory кеша.
 
     Пари, які чергуються (верх/низ клітинки), фільтруються за парністю
     числа місяця конкретної дати: парне число — предмет "зверху",
     непарне — предмет "знизу". Звичайні (нечергуючі) пари показуються
     в будь-який день.
+
+    Fallback: если in-memory кеш пуст, читает с диска и загружает в память.
     """
+    global _schedule_cache
+
     group_norm = normalize_group(group)
     day_index = target_date.weekday()
     key = f"{course}_{group_norm}_{day_index}"
     is_even_day = target_date.day % 2 == 0
 
-    if os.path.exists(CACHE_FILE):
+    source = _schedule_cache
+
+    # Fallback: загрузить с диска, если в памяти пусто
+    if not source and os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                cache_data = json.load(f)
-                if key in cache_data:
-                    all_lessons = cache_data[key]
-                    result = []
-                    for lesson in all_lessons:
-                        parity = lesson.get("parity", "any")
-                        if parity == "any":
-                            result.append(lesson)
-                        elif parity == "even" and is_even_day:
-                            result.append(lesson)
-                        elif parity == "odd" and not is_even_day:
-                            result.append(lesson)
-                    return result
+                source = json.load(f)
+                _schedule_cache = source
+                logger.info(f"📂 Кэш загружен с диска в память ({len(source)} ключей)")
         except Exception as e:
             logger.error(f"Ошибка чтения файла кэша: {e}")
+            return []
 
-    return []
+    if key not in source:
+        return []
+
+    all_lessons = source[key]
+    result = []
+    for lesson in all_lessons:
+        parity = lesson.get("parity", "any")
+        if parity == "any":
+            result.append(lesson)
+        elif parity == "even" and is_even_day:
+            result.append(lesson)
+        elif parity == "odd" and not is_even_day:
+            result.append(lesson)
+    return result
 
 
+async def rebuild_schedule_cache():
+    """Пересоздает кеш расписания. Вызывается планировщиком ежедневно в 00:00."""
+    from utils import get_current_semester
+
+    logger.info("🔄 Запуск ежедневного пересоздания кэша расписания...")
+
+    # Удаляем старый файл кеша
+    if os.path.exists(CACHE_FILE):
+        try:
+            os.remove(CACHE_FILE)
+            logger.info(f"🗑️ Старый файл кэша {CACHE_FILE} удален")
+        except Exception as e:
+            logger.error(f"Ошибка удаления файла кэша: {e}")
+
+    semester = get_current_semester()
+    await build_and_save_schedule_cache([1, 2, 3, 4], semester)
+    logger.info("✅ Ежедневное пересоздание кэша завершено")
+
+
+# ---------------------------------------------------------------------------
+# Substitutions (замены) — парсинг с сайта в реальном времени
+# ---------------------------------------------------------------------------
 async def fetch_substitution_pdf(target_date: datetime) -> Optional[bytes]:
-    """Загружает файл замен с сайта."""
+    """Загружает файл замен с сайта (через shared HTTP-сессию)."""
     date_str = target_date.strftime("%d.%m.%Y")
     direct_url = f"{SUBSTITUTIONS_BASE_URL}{date_str}.pdf"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Referer": SCHEDULE_PAGE_URL,
-    }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(direct_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    return await resp.read()
+        session = await get_http_session()
 
-            async with session.get(SCHEDULE_PAGE_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    soup = BeautifulSoup(html, "html.parser")
-                    for a_tag in soup.find_all("a", href=True):
-                        href = a_tag["href"]
-                        if date_str in href or date_str.replace('.', '_') in href:
-                            file_url = href if href.startswith("http") else f"https://ztk.org.ua{href}"
-                            async with session.get(file_url, headers=headers) as pdf_resp:
-                                if pdf_resp.status == 200:
-                                    return await pdf_resp.read()
+        async with session.get(direct_url) as resp:
+            if resp.status == 200:
+                return await resp.read()
+
+        async with session.get(SCHEDULE_PAGE_URL) as resp:
+            if resp.status == 200:
+                html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+                for a_tag in soup.find_all("a", href=True):
+                    href = a_tag["href"]
+                    if date_str in href or date_str.replace('.', '_') in href:
+                        file_url = href if href.startswith("http") else f"https://ztk.org.ua{href}"
+                        async with session.get(file_url) as pdf_resp:
+                            if pdf_resp.status == 200:
+                                return await pdf_resp.read()
     except Exception as e:
         logger.error(f"Ошибка загрузки замен: {e}")
     return None
@@ -520,6 +612,9 @@ def apply_substitutions(lessons: List[Dict], subs: List[Dict]) -> List[Dict]:
     return updated_lessons
 
 
+# ---------------------------------------------------------------------------
+# Response formatting
+# ---------------------------------------------------------------------------
 def format_lesson_line(lesson: dict) -> str:
     """Форматирует строчку пары."""
     num = lesson["number"]

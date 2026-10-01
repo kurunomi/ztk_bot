@@ -1,7 +1,6 @@
 import asyncio
 import logging
 from datetime import datetime
-import pytz
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -9,8 +8,10 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-from config import BOT_TOKEN, TIMEZONE
+from config import BOT_TOKEN, TZ
 from keyboards import get_course_keyboard, get_group_keyboard, get_day_keyboard
 from states import ScheduleStates
 from schedule_parser import (
@@ -18,14 +19,15 @@ from schedule_parser import (
     get_schedule_from_file_cache,
     get_substitutions,
     apply_substitutions,
-    format_schedule_response
+    format_schedule_response,
+    rebuild_schedule_cache,
+    close_http_session,
 )
 from utils import get_current_semester, get_today_date, get_tomorrow_date
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-TZ = pytz.timezone(TIMEZONE)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -112,7 +114,7 @@ async def process_day(callback: CallbackQuery, state: FSMContext):
     )
 
     try:
-        # 1. Достаем базовые пары мгновенно из локального JSON файла
+        # 1. Достаем базовые пары мгновенно из in-memory кеша
         base_lessons = get_schedule_from_file_cache(course, semester, group, target)
 
         # 2. Замены качаем и парсим с сайта в режиме реального времени
@@ -194,11 +196,27 @@ async def main():
     # Очистка застрявших старых запросов от Telegram при старте
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # Автоматическая сборка и сохранение кэша всех пар в schedule_cache.json
+    # Автоматическая сборка и сохранение кэша всех пар
     semester = get_current_semester()
     await build_and_save_schedule_cache([1, 2, 3, 4], semester)
 
-    await dp.start_polling(bot)
+    # Планировщик: пересоздание кэша каждый день в 00:00
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        rebuild_schedule_cache,
+        CronTrigger(hour=0, minute=0, timezone=TZ),
+        id="daily_cache_rebuild",
+        name="Ежедневное пересоздание кэша",
+    )
+    scheduler.start()
+    logger.info("📅 Планировщик запущен: кэш пересоздается каждый день в 00:00")
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        scheduler.shutdown(wait=False)
+        await close_http_session()
+        logger.info("🛑 Бот остановлен, ресурсы освобождены")
 
 
 if __name__ == "__main__":

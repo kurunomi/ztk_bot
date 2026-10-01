@@ -1,9 +1,7 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from schedule_parser import extract_groups_from_pdf
-import pytz
 from datetime import datetime, timedelta
-
-TZ = pytz.timezone("Europe/Kiev")
+from config import TZ
 
 
 def get_course_keyboard() -> InlineKeyboardMarkup:
@@ -15,7 +13,7 @@ def get_course_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_group_keyboard(course: int) -> InlineKeyboardMarkup:
-    # Динамически вытягивает группы из локальных файлов расписаний (1, 2, 3, 4)
+    # Динамически вытягивает группы (теперь из in-memory кеша, не из PDF)
     groups = extract_groups_from_pdf(course)
     
     rows = []

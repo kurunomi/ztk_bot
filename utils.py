@@ -1,8 +1,6 @@
 from datetime import datetime, timedelta
-import pytz
-from config import TIMEZONE
+from config import TZ
 
-TZ = pytz.timezone(TIMEZONE)
 
 def get_current_semester() -> int:
     now = datetime.now(TZ)
@@ -10,8 +8,10 @@ def get_current_semester() -> int:
         return 2
     return 1
 
+
 def get_today_date() -> datetime:
     return datetime.now(TZ)
+
 
 def get_tomorrow_date() -> datetime:
     return datetime.now(TZ) + timedelta(days=1)
