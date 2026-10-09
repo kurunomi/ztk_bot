@@ -16,6 +16,7 @@ from config import (
     SUBSTITUTIONS_BASE_URL,
     LESSON_TIMES,
     FALLBACK_GROUPS,
+    MAX_PAIR_NUM,
     get_local_schedule_path,
 )
 
@@ -117,13 +118,16 @@ def get_normal_day(text) -> Optional[str]:
 
 
 def roman_to_arabic(val: str) -> Optional[int]:
-    """Преобразует римские цифры в арабские."""
+    """Преобразует римские цифры в арабские (максимум MAX_PAIR_NUM)."""
     clean = str(val).strip().upper().replace('І', 'I').replace('Ї', 'I')
     roman_map = {
         "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6,
         "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6
     }
-    return roman_map.get(clean)
+    result = roman_map.get(clean)
+    if result and result > MAX_PAIR_NUM:
+        return None
+    return result
 
 
 def expand_para_range(val: str) -> List[int]:
@@ -161,7 +165,11 @@ def parse_cell_structured(cell_text: str) -> Tuple[str, str, str]:
             teachers.append(line)
         elif ROOM_REGEX.match(line) or (line.isdigit() and len(line) == 3):
             rooms.append(line)
-        elif line.isdigit() and int(line) in [1, 2, 3, 4, 5, 6]:
+        elif line.isdigit() and 1 <= int(line) <= MAX_PAIR_NUM:
+            # Пропускаем номера пар (1–6), чтобы они не попадали в название предмета
+            continue
+        elif line.isdigit() and int(line) > MAX_PAIR_NUM:
+            # Цифры больше MAX_PAIR_NUM (7, 8...) — мусор из PDF, тоже пропускаем
             continue
         else:
             subjects.append(line)
@@ -215,17 +223,19 @@ def extract_groups_from_pdf(course: int) -> List[str]:
 # PDF table parsing
 # ---------------------------------------------------------------------------
 def _row_para_num(row) -> Optional[int]:
-    """Ищет номер пары (арабский или римский) в первых 4 ячейках строки."""
+    """Ищет номер пары (арабский или римский) в первых 4 ячейках строки.
+    Возвращает только значения 1..MAX_PAIR_NUM, всё остальное — None.
+    """
     if not row:
         return None
     for cell in row[:4]:
         if not cell:
             continue
         val = str(cell).strip()
-        if val.isdigit() and 1 <= int(val) <= 6:
+        if val.isdigit() and 1 <= int(val) <= MAX_PAIR_NUM:
             return int(val)
         rom = roman_to_arabic(val)
-        if rom and 1 <= rom <= 6:
+        if rom and 1 <= rom <= MAX_PAIR_NUM:
             return rom
     return None
 
@@ -421,11 +431,6 @@ async def build_and_save_schedule_cache(courses: List[int], semester: int):
 def get_schedule_from_file_cache(course: int, semester: int, group: str, target_date: datetime) -> List[Dict]:
     """Мгновенно достает расписание группы из in-memory кеша.
 
-    Пари, які чергуються (верх/низ клітинки), фільтруються за парністю
-    числа місяця конкретної дати: парне число — предмет "зверху",
-    непарне — предмет "знизу". Звичайні (нечергуючі) пари показуються
-    в будь-який день.
-
     Fallback: если in-memory кеш пуст, читает с диска и загружает в память.
     """
     global _schedule_cache
@@ -481,6 +486,126 @@ async def rebuild_schedule_cache():
     semester = get_current_semester()
     await build_and_save_schedule_cache([1, 2, 3, 4], semester)
     logger.info("✅ Ежедневное пересоздание кэша завершено")
+
+
+# ---------------------------------------------------------------------------
+# Teacher lookup — поиск расписания по преподавателю
+# ---------------------------------------------------------------------------
+def get_all_teachers() -> List[str]:
+    """Возвращает отсортированный список всех уникальных преподавателей из кеша."""
+    teachers = set()
+    source = _schedule_cache
+    if not source and os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                source = json.load(f)
+        except Exception:
+            return []
+
+    for lessons in source.values():
+        for lesson in lessons:
+            teacher = lesson.get("teacher", "—")
+            if teacher and teacher != "—":
+                # Может быть "Прізвище І.І., Прізвище2 І.І."
+                for t in teacher.split(", "):
+                    t = t.strip()
+                    if t and t != "—" and TEACHER_REGEX.search(t):
+                        teachers.add(t)
+    return sorted(teachers)
+
+
+def get_teacher_schedule(teacher_name: str, day_index: int, is_even_day: bool) -> List[Dict]:
+    """Находит все пары преподавателя на заданный день из кеша.
+
+    Возвращает список dict-ов с ключами:
+        number, time, subject, group, room, parity
+    """
+    results = []
+    source = _schedule_cache
+
+    for key, lessons in source.items():
+        # key = "course_GROUP_dayIndex"
+        parts = key.rsplit("_", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            cached_day = int(parts[1])
+        except ValueError:
+            continue
+        if cached_day != day_index:
+            continue
+
+        # Извлекаем группу из ключа: "course_GROUP_day" -> "GROUP"
+        prefix_parts = parts[0].split("_", 1)
+        if len(prefix_parts) != 2:
+            continue
+        course_str = prefix_parts[0]
+        group_norm = prefix_parts[1]
+
+        for lesson in lessons:
+            teacher_field = lesson.get("teacher", "")
+            if not teacher_field:
+                continue
+            # Проверяем точное вхождение имени преподавателя
+            if teacher_name not in teacher_field:
+                continue
+
+            parity = lesson.get("parity", "any")
+            if parity == "even" and not is_even_day:
+                continue
+            if parity == "odd" and is_even_day:
+                continue
+
+            results.append({
+                "number": lesson["number"],
+                "time": lesson.get("time", LESSON_TIMES.get(lesson["number"], "")),
+                "subject": lesson.get("subject", "—"),
+                "group": group_norm,
+                "room": lesson.get("room", "—"),
+                "parity": parity,
+            })
+
+    # Убираем дубликаты (один предмет может быть у нескольких подгрупп)
+    seen = set()
+    unique = []
+    for r in results:
+        dedup_key = (r["number"], r["subject"], r["group"])
+        if dedup_key not in seen:
+            seen.add(dedup_key)
+            unique.append(r)
+
+    unique.sort(key=lambda x: x["number"])
+    return unique
+
+
+def format_teacher_schedule(teacher_name: str, day_name: str, date_str: str, lessons: List[Dict]) -> str:
+    """Форматирует расписание преподавателя."""
+    header = (
+        f"👨‍🏫 Розклад для: {teacher_name}\n"
+        f"📅 На день: {date_str} ({day_name})\n"
+        f"────────────────────\n"
+    )
+    if not lessons:
+        return header + "🎉 Пар немає!"
+
+    lines = []
+    for lesson in lessons:
+        num = lesson["number"]
+        time_str = lesson.get("time", "")
+        subj = lesson.get("subject", "—")
+        group = lesson.get("group", "—")
+        room = lesson.get("room", "—")
+
+        room_part = ""
+        if room and room != "—":
+            if any(kw in room.lower() for kw in ["ауд", "каб", "сп"]):
+                room_part = f" [{room}]"
+            else:
+                room_part = f" [ауд. {room}]"
+
+        lines.append(f"{num}. {time_str} — {subj} (гр. {group}){room_part}")
+
+    return header + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
