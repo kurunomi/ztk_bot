@@ -2,7 +2,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemo
 from schedule_parser import extract_groups_from_pdf, get_all_teachers
 from datetime import datetime, timedelta
 from config import TZ
-from utils import get_next_study_day
+from utils import get_week_dates
 
 
 def get_mode_keyboard() -> ReplyKeyboardMarkup:
@@ -36,40 +36,39 @@ def get_group_keyboard(course: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-def _build_day_buttons() -> list:
-    """Будує кнопки Сьогодні / Завтра (або Понеділок, якщо завтра вихідний)."""
+def _build_weekday_buttons() -> list:
+    """Будує кнопки для кожного робочого дня тижня (Пн–Пт) з датами."""
+    week = get_week_dates()
     now = datetime.now(TZ)
-    day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
-    today_name = day_names[now.weekday()]
+    today_str = now.strftime("%d.%m")
 
-    today_btn = KeyboardButton(
-        text=f"📅 Сьогодні ({today_name} {now.strftime('%d.%m')})"
-    )
+    short_names = {"Понеділок": "Пн", "Вівторок": "Вт", "Середа": "Ср",
+                   "Четвер": "Чт", "П'ятниця": "Пт"}
 
-    # Якщо сьогодні Пт/Сб/Нд — замість "Завтра" показуємо наступний навчальний день
-    next_day = get_next_study_day()
-    next_name = day_names[next_day.weekday()]
+    rows = []
+    row = []
+    for day_date, day_name in week:
+        short = short_names.get(day_name, day_name[:2])
+        date_str = day_date.strftime("%d.%m")
+        # Позначаємо сьогоднішній день зірочкою
+        if date_str == today_str:
+            label = f"📅 {short} {date_str} ⭐"
+        else:
+            label = f"📅 {short} {date_str}"
+        row.append(KeyboardButton(text=label))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
 
-    if now.weekday() >= 4:  # Пт, Сб, Нд
-        next_btn = KeyboardButton(
-            text=f"📅 Понеділок ({next_name} {next_day.strftime('%d.%m')})"
-        )
-    else:
-        next_btn = KeyboardButton(
-            text=f"📅 Завтра ({next_name} {next_day.strftime('%d.%m')})"
-        )
-
-    return [today_btn, next_btn]
+    return rows
 
 
 def get_day_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            _build_day_buttons(),
-            [KeyboardButton(text="⬅️ Назад"), KeyboardButton(text="🏠 На початок")],
-        ],
-        resize_keyboard=True,
-    )
+    rows = _build_weekday_buttons()
+    rows.append([KeyboardButton(text="⬅️ Назад"), KeyboardButton(text="🏠 На початок")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def get_teacher_letter_keyboard() -> ReplyKeyboardMarkup:
@@ -97,13 +96,9 @@ def get_teacher_list_keyboard(letter: str) -> ReplyKeyboardMarkup:
 
 def get_teacher_day_keyboard() -> ReplyKeyboardMarkup:
     """Вибір дня тижня для розкладу викладача."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            _build_day_buttons(),
-            [KeyboardButton(text="⬅️ Назад"), KeyboardButton(text="🏠 На початок")],
-        ],
-        resize_keyboard=True,
-    )
+    rows = _build_weekday_buttons()
+    rows.append([KeyboardButton(text="⬅️ Назад"), KeyboardButton(text="🏠 На початок")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 REMOVE_KEYBOARD = ReplyKeyboardRemove()

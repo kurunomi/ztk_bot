@@ -17,17 +17,25 @@ def get_tomorrow_date() -> datetime:
     return datetime.now(TZ) + timedelta(days=1)
 
 
-def get_next_study_day() -> datetime:
-    """Повертає наступний навчальний день (пропускає Сб/Нд).
-    Якщо сьогодні Пт — повертає Пн, Сб — Пн, Нд — Пн.
+def get_week_dates() -> list:
+    """Повертає список (date, day_name) для робочих днів поточного тижня (Пн–Пт).
+
+    Якщо сьогодні Сб/Нд — повертає наступний тиждень.
     """
     now = datetime.now(TZ)
-    days_ahead = 1
     weekday = now.weekday()  # 0=Пн .. 6=Нд
-    if weekday == 4:      # П'ятниця → +3 = Понеділок
-        days_ahead = 3
-    elif weekday == 5:    # Субота → +2 = Понеділок
-        days_ahead = 2
-    elif weekday == 6:    # Неділя → +1 = Понеділок
-        days_ahead = 1
-    return now + timedelta(days=days_ahead)
+
+    # Знаходимо понеділок поточного тижня
+    monday = now - timedelta(days=weekday)
+
+    # Якщо вихідні — берем наступний тиждень
+    if weekday >= 5:
+        monday = monday + timedelta(weeks=1)
+
+    day_names = ["Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця"]
+    result = []
+    for i in range(5):
+        day_date = monday + timedelta(days=i)
+        result.append((day_date, day_names[i]))
+
+    return result

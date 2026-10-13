@@ -117,9 +117,38 @@ def get_normal_day(text) -> Optional[str]:
     return None
 
 
+# Таблиця заміни Unicode Roman Numerals (Ⅰ-Ⅵ) на звичайні арабські цифри.
+# PDF замін з ztk.org.ua використовує саме ці символи замість звичайних I/V.
+_UNICODE_ROMAN_MAP = {
+    "\u2160": "1",  # Ⅰ
+    "\u2161": "2",  # Ⅱ
+    "\u2162": "3",  # Ⅲ
+    "\u2163": "4",  # Ⅳ
+    "\u2164": "5",  # Ⅴ
+    "\u2165": "6",  # Ⅵ
+    "\u2166": "7",  # Ⅶ (на всяк випадок)
+    "\u2170": "1",  # ⅰ (lowercase)
+    "\u2171": "2",  # ⅱ
+    "\u2172": "3",  # ⅲ
+    "\u2173": "4",  # ⅳ
+    "\u2174": "5",  # ⅴ
+    "\u2175": "6",  # ⅵ
+}
+
+
+def _normalize_roman_input(val: str) -> str:
+    """Нормалізує рядок: замінює Unicode Roman Numerals та кириличні I/Ї на ASCII."""
+    result = str(val).strip()
+    for uchar, digit in _UNICODE_ROMAN_MAP.items():
+        if uchar in result:
+            result = result.replace(uchar, digit)
+    result = result.upper().replace('І', 'I').replace('Ї', 'I')
+    return result
+
+
 def roman_to_arabic(val: str) -> Optional[int]:
     """Преобразует римские цифры в арабские (максимум MAX_PAIR_NUM)."""
-    clean = str(val).strip().upper().replace('І', 'I').replace('Ї', 'I')
+    clean = _normalize_roman_input(val)
     roman_map = {
         "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6,
         "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6
@@ -132,7 +161,7 @@ def roman_to_arabic(val: str) -> Optional[int]:
 
 def expand_para_range(val: str) -> List[int]:
     """Разворачивает диапазоны пар."""
-    clean = str(val).strip().upper().replace('І', 'I').replace('Ї', 'I')
+    clean = _normalize_roman_input(val)
     parts = clean.split('-')
     if len(parts) == 2:
         start = roman_to_arabic(parts[0])
@@ -491,6 +520,19 @@ async def rebuild_schedule_cache():
 # ---------------------------------------------------------------------------
 # Teacher lookup — поиск расписания по преподавателю
 # ---------------------------------------------------------------------------
+def _normalize_teacher_name(name: str) -> str:
+    """Нормалізує ім'я викладача: зайві пробіли, Є↔Е в ініціалах."""
+    s = re.sub(r'\s+', ' ', name.strip())
+    # Нормалізуємо ініціали: "Прізвище І.Б." → стандартизуємо Є→Е в ініціалах
+    # бо PDF-файли непослідовні (Ходжаєва Є.Т. / Ходжаєва Е.Т.)
+    parts = s.split(' ', 1)
+    if len(parts) == 2:
+        surname = parts[0]
+        initials = parts[1].replace('Є', 'Е').replace('є', 'е')
+        s = f"{surname} {initials}"
+    return s
+
+
 def get_all_teachers() -> List[str]:
     """Возвращает отсортированный список всех уникальных преподавателей из кеша."""
     teachers = set()
@@ -510,7 +552,7 @@ def get_all_teachers() -> List[str]:
                 for t in teacher.split(", "):
                     t = t.strip()
                     if t and t != "—" and TEACHER_REGEX.search(t):
-                        teachers.add(t)
+                        teachers.add(_normalize_teacher_name(t))
     return sorted(teachers)
 
 
@@ -546,8 +588,9 @@ def get_teacher_schedule(teacher_name: str, day_index: int, is_even_day: bool) -
             teacher_field = lesson.get("teacher", "")
             if not teacher_field:
                 continue
-            # Проверяем точное вхождение имени преподавателя
-            if teacher_name not in teacher_field:
+            # Нормалізуємо перед порівнянням (Є→Е в ініціалах)
+            normalized_field = _normalize_teacher_name(teacher_field)
+            if teacher_name not in normalized_field:
                 continue
 
             parity = lesson.get("parity", "any")

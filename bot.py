@@ -37,7 +37,7 @@ from schedule_parser import (
     DAY_INDEX_TO_NAME,
     TEACHER_REGEX,
 )
-from utils import get_current_semester, get_today_date, get_tomorrow_date, get_next_study_day
+from utils import get_current_semester, get_today_date, get_week_dates
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,6 +52,24 @@ def get_day_name(weekday: int) -> str:
     return DAY_NAMES_FULL[weekday]
 
 
+def _parse_date_from_button(text: str) -> datetime | None:
+    """Витягує дату з тексту кнопки виду '📅 Пн 13.10' або '📅 Пн 13.10 ⭐'."""
+    match = re.search(r"(\d{2})\.(\d{2})", text)
+    if not match:
+        return None
+    day = int(match.group(1))
+    month = int(match.group(2))
+    now = datetime.now(TZ)
+    year = now.year
+    # Якщо місяць менший за поточний і різниця > 6 — наступний рік (грудень→січень)
+    if month < now.month and now.month - month > 6:
+        year += 1
+    try:
+        return datetime(year, month, day, tzinfo=TZ)
+    except ValueError:
+        return None
+
+
 # ──────────────────────────────────────────────
 # Загальні хендлери
 # ──────────────────────────────────────────────
@@ -62,18 +80,10 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     semester = get_current_semester()
     today = get_today_date()
-    next_day = get_next_study_day()
-
-    # У вихідні показуємо "Наступний навчальний" замість "Завтра"
-    if today.weekday() >= 4:  # Пт, Сб, Нд
-        next_label = "📅 Наступний навчальний"
-    else:
-        next_label = "📅 Завтра"
 
     await message.answer(
         f"👋 Привіт! Я бот розкладу <b>ЖТК</b>.\n\n"
         f"📅 Сьогодні: <b>{today.strftime('%d.%m.%Y')} ({get_day_name(today.weekday())})</b>\n"
-        f"{next_label}: <b>{next_day.strftime('%d.%m.%Y')} ({get_day_name(next_day.weekday())})</b>\n"
         f"📚 Поточний семестр: <b>{semester}</b>\n\n"
         f"Оберіть режим 👇",
         parse_mode="HTML",
@@ -104,7 +114,7 @@ async def mode_teacher(message: Message, state: FSMContext):
 
 
 # ──────────────────────────────────────────────
-# Розклад групи: курс → група → день
+# Розклад групи: курс → група → день тижня
 # ──────────────────────────────────────────────
 @dp.message(ScheduleStates.choosing_course, F.text.regexp(r"^📗 (\d) курс$"))
 async def process_course(message: Message, state: FSMContext):
@@ -137,7 +147,6 @@ async def group_back(message: Message, state: FSMContext):
 async def process_group(message: Message, state: FSMContext):
     group = message.text.strip()
 
-    # Проверяем, что это реальная группа из кеша
     data = await state.get_data()
     course = data.get("course")
     if not course:
@@ -152,7 +161,7 @@ async def process_group(message: Message, state: FSMContext):
     await state.update_data(group=group)
 
     await message.answer(
-        f"✅ Група: <b>{group}</b>\n\nОберіть день 👇",
+        f"✅ Група: <b>{group}</b>\n\nОберіть день тижня 👇",
         parse_mode="HTML",
         reply_markup=get_day_keyboard(),
     )
@@ -181,20 +190,16 @@ async def process_day(message: Message, state: FSMContext):
         await cmd_start(message, state)
         return
 
-    semester = get_current_semester()
-
-    if "Сьогодні" in message.text:
-        target = get_today_date()
-        day_label = "сьогодні"
-    elif "Завтра" in message.text or "Понеділок" in message.text:
-        target = get_next_study_day()
-        day_label = "завтра" if "Завтра" in message.text else "понеділок"
-    else:
-        await message.answer("❌ Не вдалося розпізнати день.")
+    target = _parse_date_from_button(message.text)
+    if not target:
+        await message.answer("❌ Не вдалося розпізнати дату.")
         return
 
+    semester = get_current_semester()
+    day_name = get_day_name(target.weekday())
+
     await message.answer(
-        f"⏳ Завантажую розклад для групи <b>{group}</b> на {day_label}...",
+        f"⏳ Завантажую розклад для групи <b>{group}</b> на {day_name}...",
         parse_mode="HTML",
     )
 
@@ -268,7 +273,6 @@ async def teacher_list_back(message: Message, state: FSMContext):
 async def process_teacher(message: Message, state: FSMContext):
     teacher_name = message.text.strip()
 
-    # Проверяем, что это реальный преподаватель
     if not TEACHER_REGEX.search(teacher_name):
         await message.answer("❌ Оберіть викладача зі списку 👇")
         return
@@ -281,7 +285,7 @@ async def process_teacher(message: Message, state: FSMContext):
     await state.update_data(teacher_name=teacher_name)
 
     await message.answer(
-        f"✅ Викладач: <b>{teacher_name}</b>\n\nОберіть день 👇",
+        f"✅ Викладач: <b>{teacher_name}</b>\n\nОберіть день тижня 👇",
         parse_mode="HTML",
         reply_markup=get_teacher_day_keyboard(),
     )
@@ -308,12 +312,9 @@ async def process_teacher_day(message: Message, state: FSMContext):
         await cmd_start(message, state)
         return
 
-    if "Сьогодні" in message.text:
-        target = get_today_date()
-    elif "Завтра" in message.text or "Понеділок" in message.text:
-        target = get_next_study_day()
-    else:
-        await message.answer("❌ Не вдалося розпізнати день.")
+    target = _parse_date_from_button(message.text)
+    if not target:
+        await message.answer("❌ Не вдалося розпізнати дату.")
         return
 
     day_index = target.weekday()
